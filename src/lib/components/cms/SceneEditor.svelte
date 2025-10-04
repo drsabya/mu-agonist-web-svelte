@@ -114,11 +114,22 @@
 		r: () => void;
 		o: () => void;
 	};
+
+	// Accept multiple shapes AssetSearch may return
+	type PickedAsset = {
+		id: string;
+		title?: string | null;
+		url?: string | null; // sometimes present
+		public_url?: string | null; // common with Supabase/Bunny
+		object_key?: string | null; // when you need to build URL yourself
+		src?: string | null; // some libs use 'src'
+	};
 	/* -------------------------------------------------------
 	   STATE
 	------------------------------------------------------- */
 	let items = $state<SceneItem[]>([]);
-	let currentAsset: { id: string; title: string; url: string } | null = $state(null);
+	// let currentAsset: { id: string; title: string; url: string } | null = $state(null);
+	let currentAsset: PickedAsset | null = $state(null);
 	let selectedId: string | null = $state(null);
 	let statusMsg = $state('');
 	let lastCreatedId: string | null = null;
@@ -324,8 +335,11 @@
 		return `${p}${id}.svg`;
 	}
 	function isInlineSvg(s?: string) {
-		return !!s && /^\s*<svg[\s\S]*<\/svg>\s*$/i.test(s);
+		if (!s) return false;
+		const t = s.trim().toLowerCase();
+		return t.startsWith('<svg') && t.includes('</svg>');
 	}
+
 	function preclean(text: string): string {
 		return text
 			.replace(/<\?xml[\s\S]*?\?>/gi, '')
@@ -744,10 +758,96 @@
 	   BUILDERS (paste/asset)
 	------------------------------------------------------- */
 	function buildItemFromText(text: string): SceneItem | null {
-		const pre = preclean(text ?? '');
+		const rawIn = (text ?? '').trim();
+
+		// 1) Data URI (data:image/svg+xml[;base64],…)
+		if (/^data:image\/svg\+xml/i.test(rawIn)) {
+			const svgString = fromDataUriToSvgString(rawIn);
+			if (svgString) {
+				const clean = sanitizeSvgDom(extractSvgBlock(preclean(svgString)));
+				if (clean) {
+					const ns = uid();
+					const namespaced = namespaceSvgIds(clean, ns);
+					const topZ = items.reduce((m, it) => Math.max(m, it.z_index), 0);
+					return {
+						id: uid(),
+						kind: 'svg',
+						src: namespaced,
+						cx_pct: 0.5,
+						cy_pct: 0.5,
+						w_pct: 0.5,
+						rot: 0,
+						z_index: topZ + 1,
+						opacity: 100,
+						role: 'none',
+						correct_target_id: null,
+						tap_message: null,
+						final_cx_pct: null,
+						final_cy_pct: null,
+						anim_type: 'none',
+						anim_duration_ms: 700,
+						anim_delay_ms: 0,
+						anim_easing: 'easeInOut',
+						anim_move_cx_pct: null,
+						anim_move_cy_pct: null,
+						anim_scale_w_pct: null,
+						anim_rotate_by: null,
+						anim_opacity: null,
+						is_scene_trigger: false,
+						moveable: true,
+						resizeable: true,
+						move_dir: null,
+						scale_factor: null,
+						title: '',
+						persisted: false
+					};
+				}
+			}
+		}
+
+		// 2) Plain URL to an SVG — treat as image (URL)
+		if (/^https?:\/\/.+\.svg(\?.*)?$/i.test(rawIn)) {
+			const topZ = items.reduce((m, it) => Math.max(m, it.z_index), 0);
+			return {
+				id: uid(),
+				kind: 'image',
+				src: rawIn,
+				cx_pct: 0.5,
+				cy_pct: 0.5,
+				w_pct: 0.5,
+				rot: 0,
+				z_index: topZ + 1,
+				opacity: 100,
+				role: 'none',
+				correct_target_id: null,
+				tap_message: null,
+				final_cx_pct: null,
+				final_cy_pct: null,
+				anim_type: 'none',
+				anim_duration_ms: 700,
+				anim_delay_ms: 0,
+				anim_easing: 'easeInOut',
+				anim_move_cx_pct: null,
+				anim_move_cy_pct: null,
+				anim_scale_w_pct: null,
+				anim_rotate_by: null,
+				anim_opacity: null,
+				is_scene_trigger: false,
+				moveable: true,
+				resizeable: true,
+				move_dir: null,
+				scale_factor: null,
+				title: '',
+				persisted: false
+			};
+		}
+
+		// 3) Literal <svg>…</svg>
+		const pre = preclean(rawIn);
 		const raw = extractSvgBlock(pre);
 		const clean = raw ? sanitizeSvgDom(raw) : '';
 		if (!clean) return null;
+
 		const ns = uid();
 		const namespaced = namespaceSvgIds(clean, ns);
 		const topZ = items.reduce((m, it) => Math.max(m, it.z_index), 0);
@@ -760,7 +860,7 @@
 			w_pct: 0.5,
 			rot: 0,
 			z_index: topZ + 1,
-			opacity: 100, // UI percent
+			opacity: 100,
 			role: 'none',
 			correct_target_id: null,
 			tap_message: null,
@@ -774,20 +874,22 @@
 			anim_move_cy_pct: null,
 			anim_scale_w_pct: null,
 			anim_rotate_by: null,
-			anim_opacity: null, // UI percent
+			anim_opacity: null,
 			is_scene_trigger: false,
 			moveable: true,
 			resizeable: true,
 			move_dir: null,
 			scale_factor: null,
 			title: '',
-			persisted: false // ✅ new item, not in DB yet
+			persisted: false
 		};
 	}
+
 	function addItemFromText(text: string) {
 		const it = buildItemFromText(text);
 		if (!it) {
-			statusMsg = 'No valid <svg>…</svg> found in clipboard.';
+			statusMsg = 'No valid SVG / URL / data URI found in clipboard.';
+			showGlobalToast('Paste failed');
 			return;
 		}
 		pushHistory('add');
@@ -796,12 +898,27 @@
 		statusMsg = 'SVG added.';
 		measureSoon();
 	}
-	function addItemFromAsset(a: { id: string; title: string; url: string }) {
+	function addItemFromAsset(a: PickedAsset) {
+		// Resolve the best possible URL from what AssetSearch gave us
+		const base = (PUBLIC_BUNNY_PUBLIC_HOST || '').replace(/\/+$/, '');
+		const resolved =
+			a.url?.trim() ||
+			a.public_url?.trim() ||
+			a.src?.trim() ||
+			(a.object_key ? (base ? `${base}/${a.object_key}` : `/${a.object_key}`) : '');
+
+		if (!resolved) {
+			statusMsg = 'Selected asset has no usable URL.';
+			showGlobalToast('No URL on asset');
+			return;
+		}
+
 		const topZ = items.reduce((m, it) => Math.max(m, it.z_index), 0);
+
 		const it: SceneItem = {
 			id: uid(),
 			kind: 'image',
-			src: a.url,
+			src: resolved,
 			cx_pct: 0.5,
 			cy_pct: 0.5,
 			w_pct: 0.5,
@@ -827,15 +944,17 @@
 			resizeable: true,
 			move_dir: null,
 			scale_factor: null,
-			title: a.title ?? '',
-			persisted: false // ✅ new item
+			title: (a.title ?? '') || '',
+			persisted: false
 		};
+
 		pushHistory('add');
 		items = [...items, it];
 		selectedId = it.id;
 		statusMsg = 'Asset added to canvas.';
 		measureSoon();
 	}
+
 	$effect(() => {
 		// only act when currentAsset is truthy (prevent loops)
 		if (!currentAsset) return;
@@ -1688,6 +1807,19 @@
 		pushHistory('set-target');
 		items = items.map((it) => (it.id === selectedId ? { ...it, correct_target_id: targetId } : it));
 		statusMsg = targetId ? `Target set to "${getItemLabelById(targetId)}".` : 'Target cleared.';
+	}
+
+	function fromDataUriToSvgString(dataUri: string): string | null {
+		try {
+			// handle both base64 and percent-encoded
+			const [, payload = ''] = dataUri.split(',', 2);
+			if (/;base64/i.test(dataUri)) {
+				return new TextDecoder().decode(Uint8Array.from(atob(payload), (c) => c.charCodeAt(0)));
+			}
+			return decodeURIComponent(payload);
+		} catch {
+			return null;
+		}
 	}
 
 	/* ---------- Z-ORDER HELPERS ---------- */
@@ -2953,6 +3085,7 @@
 <div class="mt-1 space-y-0.5 font-mono text-[11px] text-gray-700">
 	<div>Scene type: {scene_type}</div>
 	<div>Canvas: {canvasW} × {canvasH}px</div>
+	<div>Items on canvas: {items.length}</div>
 	{#if selectedId}
 		{#key selectedId}
 			<div>
