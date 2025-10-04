@@ -917,6 +917,184 @@
 		for (const k of Object.keys(runtimeVals)) delete runtimeVals[k];
 		tapRuntimeActive = false;
 	}
+	/* ---------- DRAG PREVIEW (drag scenes) ---------- */
+	// We reuse the same runtime tween infra (runtime / runtimeVals / tapRuntimeActive).
+	// These are *preview-only* positions/flags and do not mutate saved item data.
+
+	// live preview center positions for items in drag preview (cx, cy as fractions 0..1)
+	let dragPreviewPositions: Record<string, { x: number; y: number }> = $state({});
+	// original centers captured at preview start (to snap back on wrong drop)
+	let dragOriginalPositions: Record<string, { x: number; y: number }> = $state({});
+	// draggable ids correctly placed (regardless of fade-out)
+	const dragPlaced = new Set<string>();
+	// draggable ids that should be hidden (no final position; fade out)
+	const dragHidden = new Set<string>();
+
+	// pointer state for drag preview
+	let previewDraggingId: string | null = null;
+	let previewDragStartX = 0;
+	let previewDragStartY = 0;
+	let previewItemStartCx = 0;
+	let previewItemStartCy = 0;
+
+	// guard to start FK tween once
+	let dragSceneFKPlayed = false;
+
+	function draggables(): SceneItem[] {
+		return items.filter((i) => i.role === 'draggable');
+	}
+	function targets(): SceneItem[] {
+		return items.filter((i) => i.role === 'target');
+	}
+	function getItemById(id: string | null | undefined) {
+		return id ? (items.find((i) => i.id === id) ?? null) : null;
+	}
+
+	function initDragPreview() {
+		// capture original centers for all items, and seed preview positions
+		dragPreviewPositions = {};
+		dragOriginalPositions = {};
+		dragPlaced.clear();
+		dragHidden.clear();
+		dragSceneFKPlayed = false;
+
+		for (const it of items) {
+			const cx = clampPct(it.cx_pct);
+			const cy = clampPct(it.cy_pct);
+			dragOriginalPositions[it.id] = { x: cx, y: cy };
+			dragPreviewPositions[it.id] = { x: cx, y: cy };
+		}
+		clearRuntime(); // start clean
+		tapDialogMsg = null;
+		measureSoon();
+	}
+
+	function resetDragPreview() {
+		dragPreviewPositions = {};
+		dragOriginalPositions = {};
+		dragPlaced.clear();
+		dragHidden.clear();
+		dragSceneFKPlayed = false;
+		clearRuntime();
+		tapDialogMsg = null;
+		measureSoon();
+	}
+
+	// DOM helpers for hit-testing
+	function rectOf(el: Element | null): DOMRect | null {
+		if (!el) return null;
+		try {
+			return el.getBoundingClientRect();
+		} catch {
+			return null;
+		}
+	}
+	function rectsOverlap(a: DOMRect | null, b: DOMRect | null) {
+		if (!a || !b) return false;
+		return !(a.right < b.left || a.left > b.right || a.bottom < b.top || a.top > b.bottom);
+	}
+	function centerOfRect(r: DOMRect | null) {
+		if (!r) return { x: 0, y: 0 };
+		return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+	}
+	function pointInsideRect(pt: { x: number; y: number }, r: DOMRect | null) {
+		if (!r) return false;
+		return pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom;
+	}
+
+	function isOverCorrectTarget(dragId: string): 'correct' | 'wrong' | 'none' {
+		const dragHolder = holderMap[dragId];
+		const dragRect = rectOf(dragHolder);
+		const dragCenter = centerOfRect(dragRect);
+
+		const dragItem = getItemById(dragId);
+		if (!dragItem) return 'none';
+
+		const correctId = dragItem.correct_target_id ?? null;
+		const corrItem = getItemById(correctId);
+		const corrRect = rectOf(corrItem ? holderMap[corrItem.id] : null);
+
+		if (corrRect && pointInsideRect(dragCenter, corrRect)) return 'correct';
+
+		// If overlapping any other target => "wrong"
+		for (const t of targets()) {
+			if (!corrItem || t.id !== corrItem.id) {
+				const tRect = rectOf(holderMap[t.id]);
+				if (rectsOverlap(dragRect, tRect)) return 'wrong';
+			}
+		}
+		return 'none';
+	}
+
+	// Animate a single draggable to its final position (if provided), else fade out.
+	function settleDraggableAfterCorrectDrop(it: SceneItem) {
+		ensureRuntimeForItem(it);
+		const anim = runtime.get(it.id)!;
+		const ease = easingOf(it);
+		const dur = Math.max(
+			1,
+			Number.isFinite(it.anim_duration_ms as number) ? (it.anim_duration_ms as number) : 400
+		);
+
+		// If final position provided → move there; else fade out and mark hidden.
+		if (isFinite(it.final_cx_pct as number) && isFinite(it.final_cy_pct as number)) {
+			const fx = clampPct(it.final_cx_pct as number);
+			const fy = clampPct(it.final_cy_pct as number);
+			// Start from current displayed (preview) center: seed runtime to current
+			const pos = dragPreviewPositions[it.id] ?? { x: it.cx_pct, y: it.cy_pct };
+			anim.x.set(pos.x, { duration: 0 });
+			anim.y.set(pos.y, { duration: 0 });
+			anim.x.set(fx, { duration: dur, easing: ease });
+			anim.y.set(fy, { duration: dur, easing: ease });
+			// update preview position to final when done (best-effort)
+			setTimeout(() => {
+				dragPreviewPositions[it.id] = { x: fx, y: fy };
+			}, dur + 10);
+		} else {
+			// No final -> fade out to 0 opacity
+			const curO = displayOpacityPct(it);
+			anim.o.set(curO, { duration: 0 });
+			anim.o.set(0, { duration: dur, easing: ease });
+			setTimeout(() => {
+				dragHidden.add(it.id);
+			}, dur + 10);
+		}
+		tapRuntimeActive = true;
+		dragPlaced.add(it.id);
+	}
+
+	function allDragsResolved(): boolean {
+		const ds = draggables();
+		if (!ds.length) return false;
+		return ds.every((d) => dragPlaced.has(d.id) || dragHidden.has(d.id));
+	}
+
+	// Start FK tweens for all items *from current visual state* (don’t rewind to base).
+	function startFinalKeyframeTweensFromCurrent() {
+		for (const it of items) ensureRuntimeForItem(it);
+
+		for (const it of items) {
+			if (!hasAnyFK(it)) continue;
+			const anim = runtime.get(it.id)!;
+			const delay = Math.max(
+				0,
+				Number.isFinite(it.anim_delay_ms as number) ? (it.anim_delay_ms as number) : 0
+			);
+			const duration = Math.max(
+				1,
+				Number.isFinite(it.anim_duration_ms as number) ? (it.anim_duration_ms as number) : 700
+			);
+			const ease = easingOf(it);
+
+			// Don't reset to base — go wherever we are now → FK dest
+			anim.x.set(destX(it), { delay, duration, easing: ease });
+			anim.y.set(destY(it), { delay, duration, easing: ease });
+			anim.w.set(destW(it), { delay, duration, easing: ease });
+			anim.r.set(destR(it), { delay, duration, easing: ease });
+			anim.o.set(destO(it), { delay, duration, easing: ease });
+		}
+		tapRuntimeActive = true;
+	}
 
 	function startTapTweens() {
 		// Prepare runtime stores for current items
@@ -1066,13 +1244,26 @@
 
 	/* ---------- display helpers (modes) ---------- */
 	function displayCxPct(it: SceneItem): number {
-		if (previewMode && scene_type === 'tap' && tapRuntimeActive && runtimeVals[it.id]) {
+		// runtime tweens (tap OR dragdrop)
+		if (
+			previewMode &&
+			(scene_type === 'tap' || scene_type === 'dragdrop') &&
+			tapRuntimeActive &&
+			runtimeVals[it.id]
+		) {
 			return clampPct(runtimeVals[it.id].x);
 		}
+		// dragdrop preview manual position
+		if (previewMode && scene_type === 'dragdrop') {
+			const p = dragPreviewPositions[it.id];
+			if (p) return clampPct(p.x);
+		}
+
 		if (finalKeyframeMode) return it.anim_move_cx_pct ?? it.cx_pct;
 		if (finalPosMode && selectedId === it.id && it.role === 'draggable')
 			return it.final_cx_pct ?? it.cx_pct;
 
+		// slider preview motion
 		if (previewMode && scene_type === 'slider' && (it.moveable ?? true) && it.move_dir) {
 			const { halfW, halfH } = halfSizePct(it);
 			const { A, B } = edgeEndpointsForDir(it.move_dir, it.cx_pct, it.cy_pct, halfW, halfH);
@@ -1084,13 +1275,26 @@
 	}
 
 	function displayCyPct(it: SceneItem): number {
-		if (previewMode && scene_type === 'tap' && tapRuntimeActive && runtimeVals[it.id]) {
+		// runtime tweens (tap OR dragdrop)
+		if (
+			previewMode &&
+			(scene_type === 'tap' || scene_type === 'dragdrop') &&
+			tapRuntimeActive &&
+			runtimeVals[it.id]
+		) {
 			return clampPct(runtimeVals[it.id].y);
 		}
+		// dragdrop preview manual position
+		if (previewMode && scene_type === 'dragdrop') {
+			const p = dragPreviewPositions[it.id];
+			if (p) return clampPct(p.y);
+		}
+
 		if (finalKeyframeMode) return it.anim_move_cy_pct ?? it.cy_pct;
 		if (finalPosMode && selectedId === it.id && it.role === 'draggable')
 			return it.final_cy_pct ?? it.cy_pct;
 
+		// slider preview motion
 		if (previewMode && scene_type === 'slider' && (it.moveable ?? true) && it.move_dir) {
 			const { halfW, halfH } = halfSizePct(it);
 			const { A, B } = edgeEndpointsForDir(it.move_dir, it.cx_pct, it.cy_pct, halfW, halfH);
@@ -1102,26 +1306,49 @@
 	}
 
 	function displayWidthPct(it: SceneItem): number {
-		if (previewMode && scene_type === 'tap' && tapRuntimeActive && runtimeVals[it.id]) {
+		if (
+			previewMode &&
+			(scene_type === 'tap' || scene_type === 'dragdrop') &&
+			tapRuntimeActive &&
+			runtimeVals[it.id]
+		) {
 			return Math.max(0.05, Math.min(3.0, runtimeVals[it.id].w));
 		}
+
 		if (finalKeyframeMode) return it.anim_scale_w_pct ?? it.w_pct;
 		if (previewMode && scene_type === 'slider') return widthAtPreview(it);
 		return it.w_pct;
 	}
 
 	function displayRotRad(it: SceneItem): number {
-		if (previewMode && scene_type === 'tap' && tapRuntimeActive && runtimeVals[it.id]) {
+		if (
+			previewMode &&
+			(scene_type === 'tap' || scene_type === 'dragdrop') &&
+			tapRuntimeActive &&
+			runtimeVals[it.id]
+		) {
 			return normAngle(runtimeVals[it.id].r);
 		}
+
 		if (finalKeyframeMode) return normAngle((it.rot ?? 0) + (it.anim_rotate_by ?? 0));
 		return it.rot ?? 0;
 	}
 
 	function displayOpacityPct(it: SceneItem): number {
-		if (previewMode && scene_type === 'tap' && tapRuntimeActive && runtimeVals[it.id]) {
+		// runtime tweens (tap OR dragdrop)
+		if (
+			previewMode &&
+			(scene_type === 'tap' || scene_type === 'dragdrop') &&
+			tapRuntimeActive &&
+			runtimeVals[it.id]
+		) {
 			return clampPercent(runtimeVals[it.id].o);
 		}
+		// dragdrop preview hidden-after-correct (no final position)
+		if (previewMode && scene_type === 'dragdrop' && dragHidden.has(it.id)) {
+			return 0;
+		}
+
 		if (finalKeyframeMode) {
 			return clampPercent(
 				isFinite(it.anim_opacity as number)
@@ -1169,6 +1396,28 @@
 						startTapTweens();
 						measureSoon();
 					}
+				}
+				return;
+			}
+			// DRAG PREVIEW
+			// DRAGDROP PREVIEW
+			if (scene_type === 'dragdrop') {
+				e.preventDefault();
+				e.stopPropagation();
+				const it = items.find((i) => i.id === id);
+				if (!it) return;
+
+				// Only draggable and not already resolved/hidden
+				if (it.role === 'draggable' && !dragPlaced.has(it.id) && !dragHidden.has(it.id)) {
+					selectItem(id); // optional highlight
+					const p = dragPreviewPositions[id] ?? { x: it.cx_pct, y: it.cy_pct };
+					const c = clientToCanvasXY(e.clientX, e.clientY);
+					previewDraggingId = id;
+					previewDragStartX = c.x;
+					previewDragStartY = c.y;
+					previewItemStartCx = p.x;
+					previewItemStartCy = p.y;
+					holderMap[id]?.setPointerCapture?.(e.pointerId);
 				}
 				return;
 			}
@@ -1224,6 +1473,20 @@
 
 	function onGlobalPointerMove(e: PointerEvent) {
 		// Normal drag / FK drag
+		// DRAG PREVIEW move
+		if (previewMode && scene_type === 'dragdrop' && previewDraggingId) {
+			const c = clientToCanvasXY(e.clientX, e.clientY);
+			const dCx = canvasW > 0 ? (c.x - previewDragStartX) / canvasW : 0;
+			const dCy = canvasH > 0 ? (c.y - previewDragStartY) / canvasH : 0;
+
+			let nx = clampPct(previewItemStartCx + dCx);
+			let ny = clampPct(previewItemStartCy + dCy);
+
+			dragPreviewPositions[previewDraggingId] = { x: nx, y: ny };
+			updateSelectedDims();
+			return; // don't fall through to editor interactions
+		}
+
 		if (dragging && selectedId) {
 			const { x, y } = clientToCanvasXY(e.clientX, e.clientY);
 			const dx = x - dragStartCanvasX,
@@ -1312,6 +1575,37 @@
 	}
 
 	function onGlobalPointerUp(e: PointerEvent) {
+		// DRAG PREVIEW drop
+		if (previewMode && scene_type === 'dragdrop' && previewDraggingId) {
+			const dropId = previewDraggingId;
+			holderMap[dropId]?.releasePointerCapture?.(e.pointerId);
+			previewDraggingId = null;
+
+			const it = getItemById(dropId);
+			if (it && it.role === 'draggable') {
+				const verdict = isOverCorrectTarget(dropId);
+				if (verdict === 'correct') {
+					// success → animate to final OR fade out
+					settleDraggableAfterCorrectDrop(it);
+					// all done? trigger FK animation (from current)
+					if (!dragSceneFKPlayed && allDragsResolved()) {
+						dragSceneFKPlayed = true;
+						startFinalKeyframeTweensFromCurrent();
+					}
+				} else if (verdict === 'wrong') {
+					// snap back to original and show message
+					const orig = dragOriginalPositions[dropId] ?? { x: it.cx_pct, y: it.cy_pct };
+					dragPreviewPositions[dropId] = { ...orig };
+					tapDialogMsg = 'Not the correct target. Try again.';
+					setTimeout(() => (tapDialogMsg = null), 1400);
+				} else {
+					// none — just leave it where it is (no message)
+				}
+			}
+			measureSoon();
+			return;
+		}
+
 		if (dragging && selectedId) holderMap[selectedId!]?.releasePointerCapture?.(e.pointerId);
 		dragging = false;
 
@@ -2317,15 +2611,20 @@
 				on:click={() => toggleFinalKeyframeMode()}
 				title="Final Keyframe mode (edit final transform/opacity for ALL items)"
 				aria-pressed={finalKeyframeMode}
+				disabled={previewMode}
 			>
 				<DiamondPlus size={16} strokeWidth={1.5} />
 			</button>
 		{/if}
+
 		{#if scene_type === 'slider'}
+			<!-- SLIDER -->
 			<button
 				class={`rounded p-1.5 ${previewMode ? 'bg-black text-white' : ''}`}
 				on:click={() => {
 					previewMode = !previewMode;
+					// Optional: reset the slider scrubber on exit
+					// if (!previewMode) previewT = 0;
 					measureSoon();
 				}}
 				title={previewMode ? 'Exit preview' : 'Enter preview'}
@@ -2333,8 +2632,8 @@
 			>
 				<Play size={16} strokeWidth={1.5} />
 			</button>
-		{/if}
-		{#if scene_type === 'tap'}
+		{:else if scene_type === 'tap'}
+			<!-- TAP -->
 			<button
 				class={`rounded p-1.5 ${previewMode ? 'bg-black text-white' : ''}`}
 				on:click={() => {
@@ -2351,17 +2650,48 @@
 			>
 				<Play size={16} strokeWidth={1.5} />
 			</button>
-		{/if}
-		{#if previewMode && scene_type === 'tap'}
+			{#if previewMode}
+				<button
+					class="p-1.5"
+					on:click={() => {
+						clearRuntime();
+					}}
+					title="Reset to initial state"
+				>
+					<RotateCcw size={16} strokeWidth={1.5} />
+				</button>
+			{/if}
+		{:else if scene_type === 'dragdrop'}
+			<!-- DRAGDROP -->
 			<button
-				class="p-1.5"
+				class={`rounded p-1.5 ${previewMode ? 'bg-black text-white' : ''}`}
 				on:click={() => {
-					clearRuntime();
+					if (!previewMode) {
+						initDragPreview();
+					} else {
+						resetDragPreview();
+					}
+					previewMode = !previewMode;
+					measureSoon();
 				}}
-				title="Reset to initial state"
+				title={previewMode ? 'Exit preview' : 'Enter preview'}
+				aria-pressed={previewMode}
 			>
-				<RotateCcw size={16} strokeWidth={1.5} />
+				<Play size={16} strokeWidth={1.5} />
 			</button>
+			{#if previewMode}
+				<button
+					class="p-1.5"
+					on:click={() => {
+						resetDragPreview();
+						initDragPreview();
+						measureSoon();
+					}}
+					title="Reset to initial state"
+				>
+					<RotateCcw size={16} strokeWidth={1.5} />
+				</button>
+			{/if}
 		{/if}
 	</div>
 	{#if previewMode && scene_type === 'slider'}
@@ -2398,6 +2728,15 @@
 		>
 			<div class="font-mono text-[11px] text-gray-700">
 				Tap a <span class="font-semibold">tappable</span> item.
+			</div>
+		</div>
+	{:else if previewMode && scene_type === 'dragdrop'}
+		<!-- DRAG preview hint bar -->
+		<div
+			class="overlay-strip pointer-events-none absolute bottom-4 left-1/2 z-[9999] flex -translate-x-1/2 rounded border bg-white/80 px-2 py-1.5 shadow-lg"
+		>
+			<div class="font-mono text-[11px] text-gray-700">
+				Drag each <span class="font-semibold">draggable</span> onto its correct target.
 			</div>
 		</div>
 	{:else}
