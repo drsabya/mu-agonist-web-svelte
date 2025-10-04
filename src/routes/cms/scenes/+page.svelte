@@ -34,6 +34,7 @@
 </script>
 
 <div class="p-3 font-mono">
+	<a href="/" class="text-sm underline underline-offset-2">&larr; Home</a>
 	<!-- CREATE: title + scene_type (fixed after creation) -->
 	<form class="flex flex-col gap-2 border p-3" method="post" action="?/create">
 		<h1 class="font-bold">Create a scene</h1>

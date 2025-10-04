@@ -2,6 +2,8 @@
 	// SceneEditor.svelte — paste, select, drag, resize, rotate, deselect, reorder, delete, undo,
 	// role menu, target menu, save; FINAL POSITION mode (draggable only) + GLOBAL FINAL KEYFRAME mode (all items)
 	import { onMount, onDestroy, tick } from 'svelte';
+	import { tweened } from 'svelte/motion';
+	import { linear, cubicInOut } from 'svelte/easing';
 	import { PUBLIC_BUNNY_PUBLIC_HOST } from '$env/static/public';
 	import AssetSearch from './AssetSearch.svelte';
 
@@ -22,7 +24,8 @@
 		DiamondPlus,
 		Crosshair,
 		Settings2,
-		Play
+		Play,
+		RotateCcw
 	} from '@lucide/svelte';
 
 	/* -------------------------------------------------------
@@ -100,7 +103,17 @@
 		// ✅ Persistence marker: true when this item exists in DB (hydrated or created once)
 		persisted?: boolean;
 	};
-
+	/* ---------- TAP PREVIEW RUNTIME (per-item tweened) ---------- */
+	type TweenNum = ReturnType<typeof tweened<number>>;
+	type RuntimeAnim = { x: TweenNum; y: TweenNum; w: TweenNum; r: TweenNum; o: TweenNum };
+	type RuntimeVals = { x: number; y: number; w: number; r: number; o: number };
+	type RuntimeUnsubs = {
+		x: () => void;
+		y: () => void;
+		w: () => void;
+		r: () => void;
+		o: () => void;
+	};
 	/* -------------------------------------------------------
 	   STATE
 	------------------------------------------------------- */
@@ -145,6 +158,15 @@
 	let canvasW = $state(0);
 	let canvasH = $state(0);
 	let roCanvas: ResizeObserver | null = null;
+
+	/* ---------- TAP PREVIEW / PLAY RUNTIME ---------- */
+	let tapDialogMsg = $state<string | null>(null); // simple modal text
+
+	let playActive = $state(false); // a tween is running
+	let playStartedAt = 0; // ms timestamp
+	let playNow = $state(0); // changes every rAF to drive reactivity
+	let playRaf: number | null = null; // rAF handle
+	let playLatchedFinal = $state(false); // when true, stay at final keyframe state (even after tween ends)
 
 	/* holder refs */
 	/* live rendered size for all items (px); updated on measureSoon() */
@@ -201,6 +223,11 @@
 	let rotateInitial = 0;
 	let rotateCenterX = 0;
 	let rotateCenterY = 0;
+
+	let tapRuntimeActive = $state(false); // are runtime tweens driving preview?
+	const runtime = new Map<string, RuntimeAnim>(); // item.id -> tween stores
+	const runtimeVals: Record<string, RuntimeVals> = $state({}); // latest numbers for each item
+	const runtimeUnsubs = new Map<string, RuntimeUnsubs>(); // unsubscribes for cleanup
 
 	/* ---------- PREVIEW / PLAY MODE (slider scenes) ---------- */
 	let previewMode = $state(false); // global toggle for preview/play
@@ -413,6 +440,59 @@
 		return a + (b - a) * t;
 	}
 
+	/* ---------- EASING / PROGRESS ---------- */
+	function easeLinear(t: number) {
+		return t;
+	}
+	function easeInOutCubic(t: number) {
+		return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 1, 3) / 2;
+	}
+
+	function itemProgress(it: SceneItem): number {
+		if (!playActive) return 0;
+		const delay = Number.isFinite(it.anim_delay_ms as number) ? (it.anim_delay_ms as number) : 0;
+		const dur = Math.max(
+			1,
+			Number.isFinite(it.anim_duration_ms as number) ? (it.anim_duration_ms as number) : 700
+		);
+		const raw = (playNow - playStartedAt - delay) / dur;
+		const clamped = Math.min(1, Math.max(0, raw));
+		const easing = it.anim_easing === 'linear' ? easeLinear : easeInOutCubic;
+		return easing(clamped);
+	}
+
+	function startPlayTween() {
+		// We latch the scene to final state immediately; tween will animate into it.
+		playLatchedFinal = true;
+
+		playActive = true;
+		playStartedAt = performance.now();
+
+		const loop = () => {
+			if (!playActive) return;
+			playNow = performance.now();
+
+			const allDone = items.every((it) => itemProgress(it) >= 1);
+			if (allDone) {
+				playActive = false;
+				playRaf = null;
+				return;
+			}
+
+			playRaf = requestAnimationFrame(loop);
+		};
+
+		if (playRaf) cancelAnimationFrame(playRaf);
+		playRaf = requestAnimationFrame(loop);
+	}
+
+	function stopPlayTween() {
+		playActive = false;
+		if (playRaf) cancelAnimationFrame(playRaf);
+		playRaf = null;
+		// NOTE: we DO NOT clear playLatchedFinal here; that’s what keeps things at FK.
+	}
+
 	// Given base center (cx, cy) and half sizes, build edge-to-edge endpoints for a direction.
 	function edgeEndpointsForDir(
 		dir: string | null | undefined,
@@ -490,6 +570,52 @@
 			// shrink from base -> min
 			return lerp(w0, minW, -t);
 		}
+	}
+	function easingOf(it: SceneItem) {
+		return it.anim_easing === 'linear' ? linear : cubicInOut;
+	}
+	function hasAnyFK(it: SceneItem): boolean {
+		return (
+			it.anim_move_cx_pct != null ||
+			it.anim_move_cy_pct != null ||
+			it.anim_scale_w_pct != null ||
+			it.anim_rotate_by != null ||
+			it.anim_opacity != null
+		);
+	}
+
+	// Base (start) and Dest (final keyframe) per property
+	function baseX(it: SceneItem) {
+		return it.cx_pct;
+	}
+	function baseY(it: SceneItem) {
+		return it.cy_pct;
+	}
+	function baseW(it: SceneItem) {
+		return it.w_pct;
+	}
+	function baseR(it: SceneItem) {
+		return it.rot ?? 0;
+	}
+	function baseO(it: SceneItem) {
+		return clampPercent(isFinite(it.opacity as number) ? (it.opacity as number) : 100);
+	}
+
+	function destX(it: SceneItem) {
+		return it.anim_move_cx_pct ?? it.cx_pct;
+	}
+	function destY(it: SceneItem) {
+		return it.anim_move_cy_pct ?? it.cy_pct;
+	}
+	function destW(it: SceneItem) {
+		return it.anim_scale_w_pct ?? it.w_pct;
+	}
+	function destR(it: SceneItem) {
+		return normAngle((it.rot ?? 0) + (it.anim_rotate_by ?? 0));
+	}
+	function destO(it: SceneItem) {
+		const fk = isFinite(it.anim_opacity as number) ? (it.anim_opacity as number) : null;
+		return clampPercent(fk == null ? baseO(it) : fk);
 	}
 
 	/* -------------------------------------------------------
@@ -753,6 +879,100 @@
 		if (h !== selH) selH = h;
 	}
 
+	function ensureRuntimeForItem(it: SceneItem) {
+		if (runtime.has(it.id)) return;
+
+		const anim: RuntimeAnim = {
+			x: tweened<number>(baseX(it), { duration: 0 }),
+			y: tweened<number>(baseY(it), { duration: 0 }),
+			w: tweened<number>(baseW(it), { duration: 0 }),
+			r: tweened<number>(baseR(it), { duration: 0 }),
+			o: tweened<number>(baseO(it), { duration: 0 })
+		};
+		runtime.set(it.id, anim);
+
+		// init snapshot + subscriptions
+		runtimeVals[it.id] = { x: baseX(it), y: baseY(it), w: baseW(it), r: baseR(it), o: baseO(it) };
+		const unsubs: RuntimeUnsubs = {
+			x: anim.x.subscribe((v) => (runtimeVals[it.id] = { ...runtimeVals[it.id], x: v })),
+			y: anim.y.subscribe((v) => (runtimeVals[it.id] = { ...runtimeVals[it.id], y: v })),
+			w: anim.w.subscribe((v) => (runtimeVals[it.id] = { ...runtimeVals[it.id], w: v })),
+			r: anim.r.subscribe((v) => (runtimeVals[it.id] = { ...runtimeVals[it.id], r: v })),
+			o: anim.o.subscribe((v) => (runtimeVals[it.id] = { ...runtimeVals[it.id], o: v }))
+		};
+		runtimeUnsubs.set(it.id, unsubs);
+	}
+
+	function clearRuntime() {
+		// stop & cleanup
+		for (const [id, un] of runtimeUnsubs) {
+			un.x();
+			un.y();
+			un.w();
+			un.r();
+			un.o();
+		}
+		runtimeUnsubs.clear();
+		runtime.clear();
+		for (const k of Object.keys(runtimeVals)) delete runtimeVals[k];
+		tapRuntimeActive = false;
+	}
+
+	function startTapTweens() {
+		// Prepare runtime stores for current items
+		for (const it of items) ensureRuntimeForItem(it);
+
+		// Rewind to base instantly so replay feels consistent
+		for (const it of items) {
+			const anim = runtime.get(it.id)!;
+			anim.x.set(baseX(it), { duration: 0 });
+			anim.y.set(baseY(it), { duration: 0 });
+			anim.w.set(baseW(it), { duration: 0 });
+			anim.r.set(baseR(it), { duration: 0 });
+			anim.o.set(baseO(it), { duration: 0 });
+		}
+
+		// Launch per-item tweens only if FK values are defined
+		for (const it of items) {
+			if (!hasAnyFK(it)) continue;
+			const anim = runtime.get(it.id)!;
+			const delay = Math.max(
+				0,
+				Number.isFinite(it.anim_delay_ms as number) ? (it.anim_delay_ms as number) : 0
+			);
+			const duration = Math.max(
+				1,
+				Number.isFinite(it.anim_duration_ms as number) ? (it.anim_duration_ms as number) : 700
+			);
+			const ease = easingOf(it);
+
+			// Set each property independently (simultaneous start; each with same delay/duration/ease per item)
+			anim.x.set(destX(it), { delay, duration, easing: ease });
+			anim.y.set(destY(it), { delay, duration, easing: ease });
+			anim.w.set(destW(it), { delay, duration, easing: ease });
+			anim.r.set(destR(it), { delay, duration, easing: ease });
+			anim.o.set(destO(it), { delay, duration, easing: ease });
+		}
+
+		tapRuntimeActive = true;
+	}
+	const DEBUG_TWEENS = false;
+	if (DEBUG_TWEENS) {
+		console.group('[TapPreview] start');
+		for (const it of items) {
+			if (!hasAnyFK(it)) continue;
+			console.table({
+				id: it.id,
+				delay: it.anim_delay_ms ?? 0,
+				duration: it.anim_duration_ms ?? 700,
+				easing: it.anim_easing ?? 'easeInOut',
+				base: { x: baseX(it), y: baseY(it), w: baseW(it), r: baseR(it), o: baseO(it) },
+				dest: { x: destX(it), y: destY(it), w: destW(it), r: destR(it), o: destO(it) }
+			});
+		}
+		console.groupEnd();
+	}
+
 	// Reactively observe the selected element's size (idempotent)
 	$effect(() => {
 		const el = selectedId ? holderMap[selectedId] : null;
@@ -765,6 +985,19 @@
 		roSel.observe(el);
 		roSelObservedEl = el;
 		updateSelectedDims();
+	});
+
+	// Leave preview => stop animation & close any tap dialog
+	$effect(() => {
+		if (!previewMode) {
+			clearRuntime();
+			tapDialogMsg = null;
+		}
+	});
+
+	// Clean up rAF on destroy
+	onDestroy(() => {
+		stopPlayTween();
 	});
 
 	/* -------------------------------------------------------
@@ -833,70 +1066,74 @@
 
 	/* ---------- display helpers (modes) ---------- */
 	function displayCxPct(it: SceneItem): number {
-		// FK mode (non-slider) behaves as before
+		if (previewMode && scene_type === 'tap' && tapRuntimeActive && runtimeVals[it.id]) {
+			return clampPct(runtimeVals[it.id].x);
+		}
 		if (finalKeyframeMode) return it.anim_move_cx_pct ?? it.cx_pct;
-
-		// Final position mode (draggable only) — unchanged
 		if (finalPosMode && selectedId === it.id && it.role === 'draggable')
 			return it.final_cx_pct ?? it.cx_pct;
 
-		// Slider preview movement
 		if (previewMode && scene_type === 'slider' && (it.moveable ?? true) && it.move_dir) {
 			const { halfW, halfH } = halfSizePct(it);
 			const { A, B } = edgeEndpointsForDir(it.move_dir, it.cx_pct, it.cy_pct, halfW, halfH);
-			const ts = tSym(); // [-1..1]
-			// map to [0..1] for interpolation between A and B
+			const ts = tSym();
 			const tt = (ts + 1) / 2;
 			return clampPct(lerp(A.x, B.x, tt));
 		}
-
 		return it.cx_pct;
 	}
 
 	function displayCyPct(it: SceneItem): number {
-		// FK mode (non-slider) behaves as before
+		if (previewMode && scene_type === 'tap' && tapRuntimeActive && runtimeVals[it.id]) {
+			return clampPct(runtimeVals[it.id].y);
+		}
 		if (finalKeyframeMode) return it.anim_move_cy_pct ?? it.cy_pct;
-
-		// Final position mode (draggable only)
 		if (finalPosMode && selectedId === it.id && it.role === 'draggable')
 			return it.final_cy_pct ?? it.cy_pct;
 
-		// Slider preview movement
 		if (previewMode && scene_type === 'slider' && (it.moveable ?? true) && it.move_dir) {
 			const { halfW, halfH } = halfSizePct(it);
 			const { A, B } = edgeEndpointsForDir(it.move_dir, it.cx_pct, it.cy_pct, halfW, halfH);
-			const ts = tSym(); // [-1..1]
+			const ts = tSym();
 			const tt = (ts + 1) / 2;
 			return clampPct(lerp(A.y, B.y, tt));
 		}
-
 		return it.cy_pct;
 	}
 
 	function displayWidthPct(it: SceneItem): number {
-		// Final Keyframe preview takes priority in non-slider scenes
-		if (finalKeyframeMode) return it.anim_scale_w_pct ?? it.w_pct;
-
-		// Slider preview path (only slider scenes)
-		if (previewMode && scene_type === 'slider') {
-			return widthAtPreview(it); // SAFE now: widthAtPreview never calls displayWidthPct
+		if (previewMode && scene_type === 'tap' && tapRuntimeActive && runtimeVals[it.id]) {
+			return Math.max(0.05, Math.min(3.0, runtimeVals[it.id].w));
 		}
-
+		if (finalKeyframeMode) return it.anim_scale_w_pct ?? it.w_pct;
+		if (previewMode && scene_type === 'slider') return widthAtPreview(it);
 		return it.w_pct;
 	}
 
 	function displayRotRad(it: SceneItem): number {
+		if (previewMode && scene_type === 'tap' && tapRuntimeActive && runtimeVals[it.id]) {
+			return normAngle(runtimeVals[it.id].r);
+		}
 		if (finalKeyframeMode) return normAngle((it.rot ?? 0) + (it.anim_rotate_by ?? 0));
 		return it.rot ?? 0;
 	}
-	// 🔹 Opacity for rendering is in percent in UI; convert to 0..1 here.
+
 	function displayOpacityPct(it: SceneItem): number {
-		if (finalKeyframeMode)
+		if (previewMode && scene_type === 'tap' && tapRuntimeActive && runtimeVals[it.id]) {
+			return clampPercent(runtimeVals[it.id].o);
+		}
+		if (finalKeyframeMode) {
 			return clampPercent(
-				it.anim_opacity ?? (isFinite(it.opacity as number) ? (it.opacity as number) : 100)
+				isFinite(it.anim_opacity as number)
+					? (it.anim_opacity as number)
+					: isFinite(it.opacity as number)
+						? (it.opacity as number)
+						: 100
 			);
+		}
 		return clampPercent(isFinite(it.opacity as number) ? (it.opacity as number) : 100);
 	}
+
 	function holderOutline(it: SceneItem): string {
 		if (selectedId === it.id) {
 			if (finalKeyframeMode) return '1px dashed #7C3AED'; // purple in FK mode
@@ -908,10 +1145,33 @@
 
 	function onPointerDownItem(e: PointerEvent, id: string) {
 		// In preview mode, block interactions
-		if (previewMode && scene_type === 'slider') {
-			e.preventDefault();
-			e.stopPropagation();
-			return;
+		// In preview: block normal editing interactions
+		if (previewMode) {
+			// SLIDER stays as-is
+			if (scene_type === 'slider') {
+				e.preventDefault();
+				e.stopPropagation();
+				return;
+			}
+			// TAP PREVIEW
+			if (scene_type === 'tap') {
+				e.preventDefault();
+				e.stopPropagation();
+				const it = items.find((i) => i.id === id);
+				if (!it) return;
+
+				if (it.role === 'tappable') {
+					if (it.tap_message && it.tap_message.trim()) {
+						tapDialogMsg = it.tap_message.trim();
+					}
+					if (it.is_scene_trigger) {
+						// (Re)start smooth per-item tweens
+						startTapTweens();
+						measureSoon();
+					}
+				}
+				return;
+			}
 		}
 
 		if (e.button !== 0) return;
@@ -2074,6 +2334,35 @@
 				<Play size={16} strokeWidth={1.5} />
 			</button>
 		{/if}
+		{#if scene_type === 'tap'}
+			<button
+				class={`rounded p-1.5 ${previewMode ? 'bg-black text-white' : ''}`}
+				on:click={() => {
+					if (previewMode) {
+						// exiting
+						clearRuntime();
+						tapDialogMsg = null;
+					}
+					previewMode = !previewMode;
+					measureSoon();
+				}}
+				title={previewMode ? 'Exit preview' : 'Enter preview'}
+				aria-pressed={previewMode}
+			>
+				<Play size={16} strokeWidth={1.5} />
+			</button>
+		{/if}
+		{#if previewMode && scene_type === 'tap'}
+			<button
+				class="p-1.5"
+				on:click={() => {
+					clearRuntime();
+				}}
+				title="Reset to initial state"
+			>
+				<RotateCcw size={16} strokeWidth={1.5} />
+			</button>
+		{/if}
 	</div>
 	{#if previewMode && scene_type === 'slider'}
 		<!-- Preview slider replaces the icon strip -->
@@ -2100,6 +2389,15 @@
 					<span>0 (mid)</span>
 					<span>+100 (edge)</span>
 				</div>
+			</div>
+		</div>
+	{:else if previewMode && scene_type === 'tap'}
+		<!-- TAP preview hint bar -->
+		<div
+			class="overlay-strip pointer-events-none absolute bottom-4 left-1/2 z-[9999] flex -translate-x-1/2 rounded border bg-white/80 px-2 py-1.5 shadow-lg"
+		>
+			<div class="font-mono text-[11px] text-gray-700">
+				Tap a <span class="font-semibold">tappable</span> item.
 			</div>
 		</div>
 	{:else}
@@ -2666,6 +2964,24 @@
 			</div>
 		</div>
 	{/key}
+{/if}
+
+<!-- MESSAGE FOR TAPPED ITEMS -->
+{#if tapDialogMsg}
+	<div class="fixed inset-0 z-[10002] flex items-center justify-center bg-black/40">
+		<div class="w-[320px] rounded-md border bg-white p-3 shadow-xl">
+			<div class="mb-1 font-mono text-[12px] text-gray-800">Message</div>
+			<div class="text-[13px] whitespace-pre-wrap text-gray-900">{tapDialogMsg}</div>
+			<div class="mt-3 flex justify-end gap-2">
+				<button
+					class="rounded border px-2 py-1 font-mono text-[12px]"
+					on:click={() => (tapDialogMsg = null)}
+				>
+					Close
+				</button>
+			</div>
+		</div>
+	</div>
 {/if}
 
 <style>
