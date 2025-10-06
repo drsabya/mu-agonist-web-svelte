@@ -448,7 +448,8 @@
 		return false;
 	}
 	function clampPct(x: number) {
-		return Math.min(1, Math.max(0, x));
+		const n = Number.isFinite(x) ? x : 0.5; // fallback to center if bad
+		return Math.min(1, Math.max(0, n));
 	}
 	function lerp(a: number, b: number, t: number) {
 		return a + (b - a) * t;
@@ -597,6 +598,8 @@
 			it.anim_opacity != null
 		);
 	}
+	const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+	const hasFinalPos = (it: SceneItem) => isNum(it.final_cx_pct) && isNum(it.final_cy_pct);
 
 	// Base (start) and Dest (final keyframe) per property
 	function baseX(it: SceneItem) {
@@ -1059,6 +1062,9 @@
 	// guard to start FK tween once
 	let dragSceneFKPlayed = false;
 
+	// ⏱️ FK start polling timer (only in dragdrop preview)
+	let fkCheckTimer: number | null = null;
+
 	function draggables(): SceneItem[] {
 		return items.filter((i) => i.role === 'draggable');
 	}
@@ -1089,6 +1095,11 @@
 	}
 
 	function resetDragPreview() {
+		if (fkCheckTimer) {
+			clearTimeout(fkCheckTimer);
+			fkCheckTimer = null;
+		}
+
 		dragPreviewPositions = {};
 		dragOriginalPositions = {};
 		dragPlaced.clear();
@@ -1121,10 +1132,19 @@
 		return pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom;
 	}
 
+	function intersectionArea(a: DOMRect | null, b: DOMRect | null): number {
+		if (!a || !b) return 0;
+		const w = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+		const h = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+		return w * h;
+	}
+	function rectArea(r: DOMRect | null): number {
+		return r ? r.width * r.height : 0;
+	}
+
 	function isOverCorrectTarget(dragId: string): 'correct' | 'wrong' | 'none' {
 		const dragHolder = holderMap[dragId];
 		const dragRect = rectOf(dragHolder);
-		const dragCenter = centerOfRect(dragRect);
 
 		const dragItem = getItemById(dragId);
 		if (!dragItem) return 'none';
@@ -1133,19 +1153,26 @@
 		const corrItem = getItemById(correctId);
 		const corrRect = rectOf(corrItem ? holderMap[corrItem.id] : null);
 
-		if (corrRect && pointInsideRect(dragCenter, corrRect)) return 'correct';
+		// ✅ Treat as correct if there is any meaningful overlap (>=10% of draggable's area)
+		const OVERLAP_FRAC = 0.1;
+		if (corrRect) {
+			const ia = intersectionArea(dragRect, corrRect);
+			const frac = ia / Math.max(1, rectArea(dragRect));
+			if (ia > 0 && frac >= OVERLAP_FRAC) return 'correct';
+		}
 
-		// If overlapping any other target => "wrong"
+		// ❌ Wrong if overlapping some other target
 		for (const t of targets()) {
 			if (!corrItem || t.id !== corrItem.id) {
 				const tRect = rectOf(holderMap[t.id]);
-				if (rectsOverlap(dragRect, tRect)) return 'wrong';
+				if (intersectionArea(dragRect, tRect) > 0) return 'wrong';
 			}
 		}
 		return 'none';
 	}
 
 	// Animate a single draggable to its final position (if provided), else fade out.
+	// 🔁 REPLACE the entire function
 	function settleDraggableAfterCorrectDrop(it: SceneItem) {
 		ensureRuntimeForItem(it);
 		const anim = runtime.get(it.id)!;
@@ -1155,29 +1182,49 @@
 			Number.isFinite(it.anim_duration_ms as number) ? (it.anim_duration_ms as number) : 400
 		);
 
-		// If final position provided → move there; else fade out and mark hidden.
-		if (isFinite(it.final_cx_pct as number) && isFinite(it.final_cy_pct as number)) {
-			const fx = clampPct(it.final_cx_pct as number);
-			const fy = clampPct(it.final_cy_pct as number);
-			// Start from current displayed (preview) center: seed runtime to current
+		// If final is defined, tween to final; else just fade out in place.
+		if (hasFinalPos(it)) {
+			const fx = clampPct(it.final_cx_pct!);
+			const fy = clampPct(it.final_cy_pct!);
 			const pos = dragPreviewPositions[it.id] ?? { x: it.cx_pct, y: it.cy_pct };
+
+			// seed FROM current preview pose
 			anim.x.set(pos.x, { duration: 0 });
 			anim.y.set(pos.y, { duration: 0 });
+
+			// move to final
 			anim.x.set(fx, { duration: dur, easing: ease });
 			anim.y.set(fy, { duration: dur, easing: ease });
-			// update preview position to final when done (best-effort)
+
 			setTimeout(() => {
 				dragPreviewPositions[it.id] = { x: fx, y: fy };
 			}, dur + 10);
 		} else {
-			// No final -> fade out to 0 opacity
+			// ✅ NO FINAL: freeze position/size/rotation and only fade opacity to 0
+			const pos = dragPreviewPositions[it.id] ?? { x: it.cx_pct, y: it.cy_pct };
+			const curW = displayWidthPct(it);
+			const curR = displayRotRad(it);
 			const curO = displayOpacityPct(it);
+
+			// lock pose so there's zero movement
+			anim.x.set(pos.x, { duration: 0 });
+			anim.y.set(pos.y, { duration: 0 });
+			anim.w.set(curW, { duration: 0 });
+			anim.r.set(curR, { duration: 0 });
+
+			// fade out only
 			anim.o.set(curO, { duration: 0 });
 			anim.o.set(0, { duration: dur, easing: ease });
+
+			tapRuntimeActive = true;
+
+			// after fade, mark hidden & keep preview model at the same pose
 			setTimeout(() => {
-				dragHidden.add(it.id);
+				dragHidden.add(it.id); // <-- makes it invisible via holder style
+				dragPreviewPositions[it.id] = { ...pos };
 			}, dur + 10);
 		}
+
 		tapRuntimeActive = true;
 		dragPlaced.add(it.id);
 	}
@@ -1187,13 +1234,58 @@
 		if (!ds.length) return false;
 		return ds.every((d) => dragPlaced.has(d.id) || dragHidden.has(d.id));
 	}
+	// Keep draggables at their stored final_* during FK unless an explicit FK move is set
+	// Keep draggables at their stored final_* during FK in dragdrop
+	function shouldPinToFinalDuringFK(it: SceneItem): boolean {
+		return scene_type === 'dragdrop' && it.role === 'draggable' && hasFinalPos(it);
+	}
+
+	function allDragsAtFinal(eps = 0.002): boolean {
+		// Every draggable either hidden (no final) or its runtime x/y is ~final_*.
+		const ds = draggables();
+		if (!ds.length) return false;
+
+		// First ensure "resolved" (placed or hidden)
+		if (!ds.every((d) => dragPlaced.has(d.id) || dragHidden.has(d.id))) return false;
+
+		// Now check the ones that animated to a final position
+		for (const d of ds) {
+			if (dragHidden.has(d.id)) continue; // these intentionally fade out
+			const fx = d.final_cx_pct!;
+			const fy = d.final_cy_pct!;
+			if (!hasFinalPos(d)) continue;
+
+			const rv = runtimeVals[d.id];
+			if (!rv) return false;
+			if (Math.abs(rv.x - fx) > eps || Math.abs(rv.y - fy) > eps) return false;
+		}
+		return true;
+	}
+
+	function maybeStartFKAfterSettles() {
+		if (!previewMode || scene_type !== 'dragdrop' || dragSceneFKPlayed) return;
+		if (allDragsResolved() && allDragsAtFinal()) {
+			dragSceneFKPlayed = true;
+			startFinalKeyframeTweensFromCurrent();
+			return;
+		}
+		// poll briefly until the last settle tween lands
+		if (fkCheckTimer) clearTimeout(fkCheckTimer);
+		fkCheckTimer = window.setTimeout(maybeStartFKAfterSettles, 50);
+	}
 
 	// Start FK tweens for all items *from current visual state* (don’t rewind to base).
+	// 🔁 REPLACE the entire function
 	function startFinalKeyframeTweensFromCurrent() {
 		for (const it of items) ensureRuntimeForItem(it);
 
 		for (const it of items) {
+			// skip items that were intentionally hidden after correct drop
+			if (scene_type === 'dragdrop' && dragHidden.has(it.id)) continue;
+
+			// only animate things that actually have some FK property
 			if (!hasAnyFK(it)) continue;
+
 			const anim = runtime.get(it.id)!;
 			const delay = Math.max(
 				0,
@@ -1205,9 +1297,34 @@
 			);
 			const ease = easingOf(it);
 
-			// Don't reset to base — go wherever we are now → FK dest
-			anim.x.set(destX(it), { delay, duration, easing: ease });
-			anim.y.set(destY(it), { delay, duration, easing: ease });
+			// seed FROM current visual state so nothing jumps
+			const curX = displayCxPct(it);
+			const curY = displayCyPct(it);
+			const curW = displayWidthPct(it);
+			const curR = displayRotRad(it);
+			const curO = displayOpacityPct(it);
+
+			anim.x.set(curX, { duration: 0 });
+			anim.y.set(curY, { duration: 0 });
+			anim.w.set(curW, { duration: 0 });
+			anim.r.set(curR, { duration: 0 });
+			anim.o.set(curO, { duration: 0 });
+
+			// do NOT move draggables with no final position
+			const hasNoFinalForDrag =
+				scene_type === 'dragdrop' && it.role === 'draggable' && !hasFinalPos(it);
+
+			// pin draggables with an explicit final to that final during FK
+			const targetX = shouldPinToFinalDuringFK(it) ? it.final_cx_pct! : destX(it);
+			const targetY = shouldPinToFinalDuringFK(it) ? it.final_cy_pct! : destY(it);
+
+			// move only if we actually have a final (prevents the "top-right" creep)
+			if (!hasNoFinalForDrag) {
+				anim.x.set(targetX, { delay, duration, easing: ease });
+				anim.y.set(targetY, { delay, duration, easing: ease });
+			}
+
+			// still allow scale/rotate/opacity FK
 			anim.w.set(destW(it), { delay, duration, easing: ease });
 			anim.r.set(destR(it), { delay, duration, easing: ease });
 			anim.o.set(destO(it), { delay, duration, easing: ease });
@@ -1286,6 +1403,11 @@
 
 	// Leave preview => stop animation & close any tap dialog
 	$effect(() => {
+		if (fkCheckTimer) {
+			clearTimeout(fkCheckTimer);
+			fkCheckTimer = null;
+		}
+
 		if (!previewMode) {
 			clearRuntime();
 			tapDialogMsg = null;
@@ -1707,14 +1829,29 @@
 					// success → animate to final OR fade out
 					settleDraggableAfterCorrectDrop(it);
 					// all done? trigger FK animation (from current)
-					if (!dragSceneFKPlayed && allDragsResolved()) {
-						dragSceneFKPlayed = true;
-						startFinalKeyframeTweensFromCurrent();
-					}
+					// Try to start FK only after all draggables have moved to their finals
+					maybeStartFKAfterSettles();
 				} else if (verdict === 'wrong') {
-					// snap back to original and show message
 					const orig = dragOriginalPositions[dropId] ?? { x: it.cx_pct, y: it.cy_pct };
-					dragPreviewPositions[dropId] = { ...orig };
+					// Smoothly tween back to original instead of snapping
+					ensureRuntimeForItem(it);
+					const anim = runtime.get(it.id)!;
+					const ease = easingOf(it);
+					const cur = dragPreviewPositions[it.id] ?? { x: it.cx_pct, y: it.cy_pct };
+
+					// Seed from current preview position
+					anim.x.set(cur.x, { duration: 0 });
+					anim.y.set(cur.y, { duration: 0 });
+					// Tween back
+					anim.x.set(orig.x, { duration: 250, easing: ease });
+					anim.y.set(orig.y, { duration: 250, easing: ease });
+
+					tapRuntimeActive = true;
+					// After tween, update the preview model so holders read the right coords
+					setTimeout(() => {
+						dragPreviewPositions[dropId] = { ...orig };
+					}, 260);
+
 					tapDialogMsg = 'Not the correct target. Try again.';
 					setTimeout(() => (tapDialogMsg = null), 1400);
 				} else {
@@ -2573,12 +2710,21 @@
 			bind:this={holderMap[it.id]}
 			on:pointerdown={(e) => onPointerDownItem(e, it.id)}
 			style="
-				left: {displayCxPct(it) * 100}%;
-				top: {displayCyPct(it) * 100}%;
-				width: {displayWidthPct(it) * 100}%;
-				z-index: {it.z_index};
-				outline: {holderOutline(it)};
-			"
+    left: {displayCxPct(it) * 100}%;
+    top: {displayCyPct(it) * 100}%;
+    width: {displayWidthPct(it) * 100}%;
+    z-index: {it.z_index};
+    outline: {holderOutline(it)};
+    pointer-events: {previewMode && scene_type === 'dragdrop' && dragHidden.has(it.id)
+				? 'none'
+				: 'auto'};
+visibility: {previewMode && scene_type === 'dragdrop' && dragHidden.has(it.id)
+				? 'hidden'
+				: 'visible'};
+  "
+			aria-hidden={previewMode && scene_type === 'dragdrop' && dragHidden.has(it.id)
+				? 'true'
+				: 'false'}
 		>
 			<!-- Role badge -->
 			{#if it.role !== 'none'}
